@@ -1,0 +1,17 @@
+{
+  "codex": "codex.exe",
+  "model": null,
+  "poll_interval": 1.0,
+  "free_interval": 20,
+  "task_timeout": 300,
+  "tool_timeout": 135,
+  "game_absent_interval": 30,
+  "menu_poll_interval": 5,
+  "process_check_interval": 2,
+  "max_turns_per_hour": 30,
+  "max_autonomous_turns": 6,
+  "idle_timeout": 300,
+  "codex_idle_timeout": 60,
+  "burst_window_seconds": 30,
+  "max_turns_per_window": 4
+}

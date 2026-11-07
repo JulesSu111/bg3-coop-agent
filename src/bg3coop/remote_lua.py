@@ -195,10 +195,15 @@ class RemoteLua:
 
     @property
     def connected(self) -> bool:
-        return self._sock is not None
+        return self._sock is not None or bool(getattr(self, "_proxy", None))
 
     def connect(self) -> int:
         """Open the connection and do the handshake; returns the game's protocol version."""
+        from .local_transport import endpoint, request
+        self._proxy = endpoint() if self.host == "127.0.0.1" and self.port == DEFAULT_PORT else None
+        if self._proxy:
+            self.server_version = request(self._proxy, "connect", {})
+            return self.server_version
         self.close()
         self._sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -227,6 +232,7 @@ class RemoteLua:
         return self.server_version
 
     def close(self) -> None:
+        self._proxy = None
         sock, self._sock = self._sock, None
         if sock is not None:
             try:
@@ -254,6 +260,10 @@ class RemoteLua:
         its end of a connection the client hung up, and with enough of those the port stops
         serving.
         """
+        if getattr(self, "_proxy", None):
+            from .local_transport import request
+            return request(self._proxy, "evaluate", {"code": code, "context": context,
+                                                      "timeout": timeout, "statement": statement})
         if context not in CONTEXT_IDS:
             raise ValueError(f"unknown context {context!r}")
         flags = FLAG_NO_VARIABLE_REFS | (FLAG_STATEMENT if statement else 0)

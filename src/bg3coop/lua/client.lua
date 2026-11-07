@@ -16,7 +16,7 @@
 
 BG3COOP_C = BG3COOP_C or {}
 local C = BG3COOP_C
-C.VERSION = 29
+C.VERSION = 30
 C.ops = {}
 
 local function get(f)
@@ -813,7 +813,18 @@ local function echo(text)
 end
 
 local function push(text, shown)
-    C.inbox[#C.inbox + 1] = text
+    local lower = text:lower()
+    local control = text:sub(1, 1) == "/" or text:sub(1, 8) == "[button]"
+        or lower == "stop" or lower == "pause" or lower == "wait"
+        or text == "暂停" or text == "停下" or text == "停止" or text == "等待" or text == "等我"
+    -- A typed reply to a live Yes/No prompt belongs to that prompt, just like its buttons.
+    local answering = next(C.asks or {}) ~= nil and not control
+    if C.localMode and not answering then
+        C.localSeq = (C.localSeq or 0) + 1
+        C.localInbox[#C.localInbox + 1] = { id = C.localSeq, text = text }
+    else
+        C.inbox[#C.inbox + 1] = text
+    end
     echo(shown or text)
     markRead()
 end
@@ -880,6 +891,11 @@ local function buildChat(tab)
     button.SameLine = true
     pcall(function() button.Size = { -1, 0 } end)
     button.OnClick = function() send() end
+    local controlRow = row:AddRow()
+    local pause = controlRow:AddCell():AddButton("Pause / 暂停")
+    pause.OnClick = function() push("/pause") end
+    local resume = controlRow:AddCell():AddButton("Resume / 继续")
+    resume.OnClick = function() push("/resume") end
     return log, input
 end
 
@@ -932,7 +948,12 @@ end
 
 local function mark(at)
     if not at then return end
-    C.inbox[#C.inbox + 1] = { point = at }
+    if C.localMode then
+        C.localSeq = C.localSeq + 1
+        C.localInbox[#C.localInbox + 1] = { id = C.localSeq, text = { point = at } }
+    else
+        C.inbox[#C.inbox + 1] = { point = at }
+    end
     echo(at.id and T("pointed") or T("spot"))
 end
 
@@ -1205,6 +1226,35 @@ function C.ops.chat_take(args)
     local msgs, shown = C.inbox, C.echo
     C.inbox, C.echo = {}, {}
     return { messages = msgs, shown = shown, lang = C.lang() }
+end
+
+-- Optional unattended controller: non-destructive reads followed by durable acknowledgement.
+function C.ops.local_inbox()
+    if not C.localMode then
+        C.localMode = true
+        C.localInbox = {}
+        C.localSeq = 0
+        C.localEpoch = tostring(Ext.Utils.MonotonicTime()) .. "-" .. tostring(math.random(1, 1000000))
+        local keep = {}
+        for _, msg in ipairs(C.inbox) do
+            if type(msg) == "string" or (type(msg) == "table" and msg.point) then
+                C.localSeq = C.localSeq + 1
+                C.localInbox[#C.localInbox + 1] = { id = C.localSeq, text = msg }
+            else keep[#keep + 1] = msg end
+        end
+        C.inbox = keep
+    end
+    ensurePanel()
+    return { epoch = C.localEpoch, messages = C.localInbox }
+end
+
+function C.ops.local_ack(args)
+    local keep = {}
+    for _, msg in ipairs(C.localInbox or {}) do
+        if msg.id > args.id then keep[#keep + 1] = msg end
+    end
+    C.localInbox = keep
+    return true
 end
 
 -- History from the bridge after a save load: [{kind, text, who, at}], oldest first.

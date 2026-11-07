@@ -1,0 +1,133 @@
+# Windows 本地无人值守模式
+
+本模式已实现并提供离线测试，**真实 BG3、Script Extender、登录任务计划和真实 OAuth 模型回合尚未实测**。不要将离线测试通过理解为实机保证。原有 setup、doctor、MCP 插件和远程 SSH 用法继续保留。
+
+## 一次性安装
+
+需要 Windows 10/11、uv、BG3 Script Extender，以及当前 Windows 用户已通过 ChatGPT OAuth 登录的原生 Codex。后台使用官方 `codex app-server`，不要求打开 Codex 窗口，不使用 API Key。若本机只有 ChatGPT App 登录而 Codex 凭据不可用，不能假定两者共享登录：需要先完成一次 Codex ChatGPT 登录。认证失效后也可能需要在游戏外重新登录；不会默默改用付费 API。
+
+在仓库目录执行（普通用户，无需管理员）：
+
+```powershell
+uv sync --python 3.13 --group dev
+.\install.ps1
+```
+
+安装器优先寻找 PATH 中的 `codex.exe`，其次寻找 Codex 本机 standalone 安装；找不到时传入 `-CodexPath 'C:\完整路径\codex.exe'`。可用 `-PythonPath` 指定已安装本项目的 Python。仓库和 `.venv` 安装后必须保留在当前位置。下载脚本受组织执行策略限制时，请按本机策略签名或解除文件阻止；安装器不会改系统执行策略。
+
+游戏尚未启用 Lua 调试器时，可显式执行 `.\install.ps1 -ConfigureGame`，复用 `setup --no-mod`。它保留已有设置的其他键，不安装可选记忆 Mod，不改存档或 Mod 装载顺序。原有 `bg3coop setup` 的可选 Mod 功能仍可手动使用。Script Extender 本身需先安装。若其 9998 监听在所有网卡，应先按原有 doctor 提示收紧到本机或使用防火墙；本模式新增服务始终只监听 127.0.0.1。
+
+安装器创建当前用户登录触发、Interactive、Limited 权限的任务 `BG3Coop-<用户 SID>`，不存储 Windows 密码。任务直接运行原生基础解释器的 `pythonw.exe` 和 `supervisor.py`，避免常驻 PowerShell/CLR 的内存开销，也避免 venv 重定向器妨碍进程清理。监督器使用按用户运行目录隔离的 mutex 防重复、Windows Job Object 管理整个进程树；守护异常退出后间隔 5 秒重启，5 分钟内连续失败 5 次则停止，等待人工检查。正常“未开游戏”状态不会退出或重启。运行目录 ACL 限于当前用户和 SYSTEM。安装器可重复运行，会停止自己此前的进程后更新路径，不改全局 Codex 配置。
+
+安装成功后正常使用只需启动 BG3 并加载存档，F10 打开面板。游戏没运行时只有本地进程检查，不启动 App Server 或模型回合。主菜单时只探测 Lua/宿主实体，服务器 Lua 和存档实体未就绪时不报告连接完成。
+
+## 游戏内操作
+
+- `/agent Shadowheart`：接管名称包含该文本的同伴；也支持中文角色名。游戏原有规则阻止接管人类主角。不会擅自挑选角色。
+- 聊天输入框：发送任务、问题；回答在面板显示。动作和错误继续使用原有面板反馈。
+- 原有“跟随”“停下”“等我”“自由探索”快捷按钮继续生效。
+- 新增 `Pause / 暂停` 和 `Resume / 继续` 按钮；也支持 `/pause`、`/stop`、`/resume`。
+- `/wait`：等待；`/free`：允许自主探索。继续按钮恢复到等待模式，重试失败/中断的队列任务；需要自主行动时再点击自由探索或跟随。
+
+默认等待模式允许新聊天触发查询、回答和游戏内提问，禁止移动、施法、开对话等动作。等待模式下读档、战斗和对话事件不会自动唤醒模型；初次载入存档只初始化桥接/面板，不启动模型。自由/跟随模式中可完成战斗回合，并按配置间隔接续有界任务，受下文额度保护约束。
+
+「停下」撤销待处理任务、中断当前模型回合、关闭 App Server，尝试停止当前游戏动作，进入暂停状态；此后新消息只排队，需显式继续。「等我」同样停止当前模型和动作、关闭 App Server、撤销旧待处理任务，但进入等待状态，新的聊天消息仍可触发一次回答。两个按钮的确认信息由本地代码显示，不消耗模型回合。点击继续恢复失败/中断任务时可能触发模型，但继续按钮本身不额外请求模型。暂停和关闭游戏不会回滚已经发生的动作。
+
+## 待机资源与额度保护
+
+保留 Windows 登录自动启动方案，未启动 BG3 时默认每 **30 秒**调用一次 Windows Toolhelp 进程快照，不启动 `tasklist`、PowerShell 子进程或 Codex；监督器阻塞在系统进程等待，不反复轮询。主菜单默认每 **5 秒**检查 Lua/宿主实体；载入后每 **1 秒**检查游戏事件，进程列表最多每 **2 秒**检测一次。桥接服务另有 2 秒的本地 socket 等待周期，不访问游戏或模型。进程快照异常只限频写日志并继续低频等待，不让守护因此异常退出。首次模型或角色接管请求前不加载 MCP 工具栈；已经加载的 Python 模块不会主动卸载，因此游玩后的待机内存可能高于冷启动。
+
+以下字段可在 `config.json` 配置，缺失时使用默认值，必须为正数（回合数必须为整数）：
+
+| 字段 | 默认值 | 行为 |
+| --- | --- | --- |
+| `game_absent_interval` | 30 秒 | BG3 未运行时的检测间隔；游戏启动后最迟约该间隔发现 |
+| `menu_poll_interval` | 5 秒 | 主菜单/加载中探测间隔 |
+| `process_check_interval` | 2 秒 | 游戏运行时进程检测间隔 |
+| `max_turns_per_hour` | 30 | 滚动 60 分钟内最多尝试的 `turn/start` 数量，包括玩家请求、游戏事件和自主回合 |
+| `max_autonomous_turns` | 6 | 没有新玩家消息/控制指令时，连续自主/事件回合上限 |
+| `idle_timeout` | 300 秒 | 自由/跟随模式多久未收到面板消息或控制指令后自动暂停；鼠标/键盘移动不算面板活动 |
+| `codex_idle_timeout` | 60 秒 | 无运行回合时关闭闲置 App Server，保留线程 ID 供下一条消息恢复 |
+| `burst_window_seconds` | 30 秒 | 高频保护的滚动窗口 |
+| `max_turns_per_window` | 4 | 窗口内最多尝试回合数，下一次请求自动暂停 |
+
+小时预算和高频历史在发送 `turn/start` **之前**持久化，断线导致回复未知也计数；进程重启或点击继续不会清零。自主回合计数只因新的面板消息/控制指令重置。触发保护后暂停并显示原因，时间窗口到期不会自行恢复，需人工继续。自由行动仍可多轮自主执行，但不再能无限延续：连续回合、小时预算、玩家空闲及高频保护任一触发都会停止。
+
+这是本控制器的回合保护，**不是 Plus 实际剩余额度或 token 上限**。一次回合可包含多个工具调用和多次上游请求，另受 `task_timeout`/`tool_timeout` 约束。真实 Plus 额度/认证/网络错误会暂停，连 `willRetry=true` 的错误通知也会终止 App Server，阻止其继续自动重试；不推断官方额度恢复时间。
+
+无需安装的隔离待机测量命令：`.\scripts\profile-standby.ps1 -Seconds 30`。它使用临时配置、无效 Codex 路径和独立桥接端口，测量监督器及**所有后代进程**（包括 Windows venv 重定向器）的 CPU、工作集和私有内存，结束后清理测试进程/文件，不注册任务、不登录或调用真实模型。应先关闭 BG3。
+
+原有 ask 的 Yes/No 按钮和提问期间的文字回复仍由当前提问工具读取；控制按钮和斜杠命令仍交给控制器。普通聊天和指向消息交给持久化队列。提问回复与原有按钮一样保留在 Lua 内存中，不承诺跨崩溃恢复。工具执行期间仍能点击暂停。恢复后先读取游戏状态，避免把“执行结果未知”的动作直接重放。
+
+## 配置、日志与卸载
+
+`%LOCALAPPDATA%\BG3Coop\`：
+
+| 文件 | 用途 |
+| --- | --- |
+| `config.json` | Codex/Python 绝对路径、模型（null 使用 Codex 默认值）、轮询/自由行动间隔、任务/工具超时，单位秒 |
+| `bridge.json` | 127.0.0.1:19999 端口及随机认证 token，不要分享 |
+| `tasks.sqlite3` | 消息去重键、顺序队列、任务状态、线程 ID、事件游标和角色身份 |
+| `daemon.log` | 运行/面板错误，单文件 2 MB，保留三个备份；可能含聊天文本 |
+| `launcher.log` | 守护进程退出和重启记录 |
+| `enabled` | 启动器运行标记 |
+
+配置变更后重新运行安装器或重启该计划任务。不要删除数据库来“修复”额度或认证问题；这会丢失去重/恢复状态。额度耗尽、认证和网络错误会把任务标为失败、暂停并显示错误；修复后点击继续，不会后台无限重试模型请求。
+
+```powershell
+.\uninstall.ps1             # 停止后台，注销任务，移除桥接标记，保留日志和队列
+.\uninstall.ps1 -RemoveData # 同时删除本模式运行数据
+```
+
+卸载先移除启动标记、禁用任务、清理旧版进程树，再停止和注销任务；不会卸载原有 MCP 插件、删除游戏存档或修改 Script Extender/Memory Mod/Mod 配置。`-RemoveData` 只删除本模式已知文件，不递归删除运行根目录，保留原有 `notes` 和未知文件（Windows 上原有 `bg3coop` 与 `BG3Coop` 路径大小写不区分）。
+
+仅停止当前运行实例，与禁止下次登录启动是两件事：
+
+```powershell
+$taskName = 'BG3Coop-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+Disable-ScheduledTask -TaskName $taskName   # 防止后续登录触发；不会停止当前实例
+Stop-ScheduledTask -TaskName $taskName      # 终止当前监督器；Job Object 清理守护/Codex/所有后代
+# 恢复时：Enable-ScheduledTask -TaskName $taskName; Start-ScheduledTask -TaskName $taskName
+```
+
+Windows Job Object 的 kill-on-close 行为已用真实隔离的父/子/孙进程测试通过；未注册任务来测试 `Stop-ScheduledTask` 本身，因此任务计划的实机路径仍待安装后验收。监督器必须是任务直接启动的原生进程，不能绕回 venv redirector。参考：[Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)、[Stop-ScheduledTask](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/stop-scheduledtask)、[Disable-ScheduledTask](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/disable-scheduledtask)。
+
+## 架构与边界
+
+一个 Python 守护进程持有唯一的 `RemoteLua` 和 `Game`，负责探测、注入、重连及事件读取。MCP 的 Game.call 和 doctor 的原始 Lua 请求通过带 token 的 loopback 服务复用它；安装标记存在而服务不可用时失败关闭，不另连 9998。没有安装标记时保留原直接连接行为。SSH/自定义端口仍走原实现；不要同时用其他调试器直接连接本机 9998。另一个旧版本 MCP 进程无法自动识别新代理，安装后需关闭旧进程让插件重启。
+
+Lua 客户端使用 `local_inbox`/`local_ack` 非破坏读取消息；SQLite 唯一键去重，提交后才 ack。同一 Lua 状态中的重复投递不产生第二个任务。服务器事件用 epoch/seq 去重，读档后重新探测并注入。尚未拉取的 Lua 内存消息在游戏崩溃或读档时可能丢失；这类消息无法由本地数据库恢复。游戏事件环形缓存仍有原来的 200 条上限。
+
+Controller 将原 MCP 工具 schema 注册为 Codex dynamic tools（实验性协议），在本进程复用原工具函数，不再启动第二个游戏连接。它处理 `turn/completed`，结束后交还本地轮询，下个事件独立 `turn/start`；不把 `wait` 暴露给后台模型。线程 ID 持久化后用 `thread/resume` 恢复。后台连接仅接受 ChatGPT 账户，移除 API Key 环境变量，并拒绝其他账户模式。
+
+App Server 会话使用 read-only sandbox、untrusted approval，关闭 shell/patch、外部 MCP 和 Apps，不修改用户全局配置。仅游戏动态工具由本地白名单执行；其他系统权限请求均拒绝。游戏内动作权限由当前模式和有效任务代数再次检查。取消后遗留工具线程在下一次游戏 RPC 前会被拦截；正在执行的单个 Lua RPC 不能被撤回，故不能保证按下暂停的同一帧立即停止。
+
+守护进程和游戏间网络中断可能发生在“游戏已经执行动作、回复尚未到达”的时刻，无法提供跨进程恰好一次动作语义。失败/中断任务不会自动当作成功，也不会自行重放，需继续恢复并先核对状态。存档重载和游戏重启不直接编辑存档文件。
+
+官方协议来源：[Codex App Server](https://learn.chatgpt.com/docs/app-server)。开发时已用本机 Codex 0.167.0 导出的实验性 JSON schema 核对 dynamic tool 定义/返回格式；该接口随 Codex 版本变动可能需要适配。尚未执行真实模型回合。
+
+## 验收步骤（以下实机项目均尚未实测）
+
+建议先备份常规游戏数据，使用可丢弃的测试存档。无需运行任何自动测试来操作真实游戏。
+
+| 项目 | 实机操作与通过标准 |
+| --- | --- |
+| 登录启动/冷启动 | 重启 Windows 并登录，确认该用户任务运行；不开 Codex/终端，启动两种 BG3 exe 中任一种；主菜单不显示“已就绪”，不产生模型任务 |
+| 载入/面板 | 载入存档后按 F10，看到本地桥接就绪信息；输入 `/agent 角色名`，确认接管对象正确 |
+| 聊天/再次唤醒 | 连发 A、B，按顺序回应；第一轮明确结束后等一分钟，再发 C，仍有自动回应，空闲日志无连续 turn/start |
+| 快捷键/暂停 | 自由探索应行动；等我后停止自主行动；暂停应拒绝后续游戏动作；继续回到等待模式，再次自由探索可行动 |
+| 战斗/对话 | 自由模式进入战斗，AI 回合自动醒来读取战况、合法行动并结束回合；进入对话自动醒来；人类角色选项不被擅自选择 |
+| 读档/重启 | 回合中读档，旧任务被中断；重新出现面板、恢复角色并核对当前状态；退出重开游戏同样有效 |
+| 连接独占 | 同时运行新版 MCP 和 doctor，确认它们经过 19999；9998 只有守护持有一条连接；重复登录启动不增加守护进程 |
+| 断线/异常 | 临时断开桥接/结束守护，面板或日志显示错误、任务无虚假成功；启动器重启后重注入；点击继续先核对再执行 |
+| OAuth/额度/网络 | 测试账户模拟登录失效、额度不足或断网，确认面板报错并暂停；恢复后继续，无 API Key 回退 |
+| 游戏退出 | 模型运行时关闭 BG3，在本地轮询周期后中止 App Server；继续等待不启动新模型回合 |
+| 卸载 | 执行卸载后重新登录，不再自启动；原 MCP、setup/doctor、Mod 和存档仍可用 |
+
+自动化测试：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+`tests/test_local.py`、`test_resource_policy.py`、`test_app_server.py` 使用假的游戏、App Server 和 LuaDebug 环境验证就绪判断、队列恢复/去重、回合完成后再唤醒、额度/高频/空闲熔断、错误通知停止重试、事件与等待门禁。`test_supervisor.py` 验证重启限流；Windows 专用 `test_windows_lifecycle.py` 实际启动并终止隔离进程树，且以 mock 任务命令和测试文件验证卸载不删除原有存档、Script Extender、Memory Mod 和本地笔记。它们不证明真实游戏兼容性。

@@ -163,3 +163,7 @@ claude
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+## Windows 本地无人值守模式
+
+新增登录后台启动、游戏内交互和事件驱动 Codex 控制器。安装、配置、架构及实机验收清单见 [Windows 使用说明](docs/windows-local.md)。真实 BG3/OAuth 端到端尚未实测。

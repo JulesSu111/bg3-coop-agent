@@ -163,3 +163,7 @@ Then restart the agent (or start a new session), close the game and run `setup` 
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Windows unattended local mode
+
+See the [Windows setup and acceptance guide](docs/windows-local.md) for the event-driven background controller, installer, and in-game controls. Real BG3 and OAuth end-to-end operation has not yet been tested.

@@ -236,8 +236,25 @@ class Game:
 
     def call(self, op: str, args: dict | None = None, context: str = "server") -> Any:
         """Run `op` in the injected script of `context` (injecting it first when needed)."""
+        guard = getattr(self, "_local_guard", None)
+        if guard:
+            guard()
+        from .local_transport import endpoint, request
+        proxy = endpoint() if not self.ssh_host and self.port == GAME_PORT else None
+        if proxy:
+            try:
+                reply = request(proxy, "game_call", {"op": op, "args": args, "context": context})
+            except (OSError, ConnectionError) as exc:
+                raise GameError(f"local bridge unavailable: {exc}") from exc
+            identity = reply["identity"]
+            self.agent_id, self.human_id, self.agent_name = identity["agent"], identity["human"], identity["name"]
+            return reply["value"]
         with self._request():
+            if guard:
+                guard()
             self._ensure_injected(context)
+            if guard:
+                guard()
             result = self._call_raw(context, op, args or {})
             if op == "set_agent" and isinstance(result, dict):
                 self.agent_id = result.get("id")
