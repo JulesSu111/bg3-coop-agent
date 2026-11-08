@@ -156,6 +156,7 @@ class Chat:
 
     def _wait_answer(self, ask_id: int, deadline: float) -> dict:
         while True:
+            self.game._authority()
             self.listen()
             if ask_id in self.answers:
                 answer = self.answers.pop(ask_id)

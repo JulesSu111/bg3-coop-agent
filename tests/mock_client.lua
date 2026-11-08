@@ -67,7 +67,11 @@ Ext = {
     Json = { Parse = function(s) return PY_parse(s) end, Stringify = function(v) return PY_stringify(v) end },
     -- MOCK_C.pick: what the mouse is over, as the picking helper reports it
     -- MOCK_C.root: a UI tree to read dialogues from (nil: nothing on screen)
-    UI = { GetRoot = function() return MOCK_C.root end, GetPickingHelper = function() return MOCK_C.pick end },
+    UI = { GetRoot = function() return MOCK_C.root end, GetPickingHelper = function() return MOCK_C.pick end,
+        Defer = function(fn)
+            if MOCK_C.holdUI then MOCK_C.deferred = fn else fn() end
+        end },
+    ClientNet = { PostMessageToServer = function(channel, payload) PY_client_net(channel, payload) end },
     Loca = { GetTranslatedString = function(h) return (MOCK_C.loca or {})[h] or "" end },
     IMGUI = {
         GetViewportSize = function() return { 2560, 1440 } end,

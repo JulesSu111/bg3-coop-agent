@@ -16,7 +16,11 @@
 
 BG3COOP_C = BG3COOP_C or {}
 local C = BG3COOP_C
-C.VERSION = 30
+if C.VERSION ~= 32 and C.panel then
+    pcall(function() C.panel.win:Destroy() end)
+    C.panel = nil
+end
+C.VERSION = 32
 C.ops = {}
 
 local function get(f)
@@ -43,6 +47,39 @@ local function widgetDC()
         end
     end
     return nil
+end
+
+function C.bindControl(session, ticket, lease, epoch, consent)
+    local replaced = C.controlSession ~= session or C.controlEpoch ~= epoch
+    if replaced or C.controlTicket ~= ticket then
+        C.blockControl()
+        C.controlBlocked = nil
+    end
+    if replaced then
+        C.consentError = C.pendingConsent and "存档或连接已变更，请重新启用接管" or nil
+        C.pendingConsent = nil
+    elseif consent and C.pendingConsent and consent.id == C.pendingConsent.id then
+        C.pendingConsent = nil
+        C.consentError = consent.error
+    end
+    if not ticket then C.requestedOff = nil end
+    C.controlSession, C.controlTicket, C.controlEpoch = session, ticket, epoch
+    C.controlUntil = Ext.Utils.MonotonicTime() + lease
+end
+
+-- Private to the owning debugger, outside C.ops and the model's chat inbox.
+function C.readControl()
+    return Ext.Json.Stringify({ off = C.requestedOff, request = C.pendingConsent, ready = C.controlLive() == true })
+end
+
+function C.blockControl()
+    C.controlBlocked = true
+    C.controlResult = nil
+    for id in pairs(C.asks or {}) do C.ops.chat_ask_close({ id = id }) end
+end
+
+function C.controlLive()
+    return C.controlUntil and Ext.Utils.MonotonicTime() < C.controlUntil
 end
 
 local function clean(s)
@@ -253,6 +290,7 @@ function C.ops.choose(args)
     local dc = widgetDC()
     local d = dc and findDialogue(dc, args.instance)
     if not d then error("no dialogue on screen") end
+    if args.owner then C.checkAnswerer(dc, d, args.owner) end
     if get(function() return d.ShowAnswers end) == false then error("no answers are shown yet; read dialogue again") end
     local list = answerList(d)
     local want = tonumber(args.n)
@@ -263,9 +301,18 @@ function C.ops.choose(args)
     if args.expect and args.expect ~= "" and not pick.text:lower():find(tostring(args.expect):lower(), 1, true) then
         error("answer " .. want .. " is now '" .. pick.text .. "'; the options changed, read them again")
     end
+    if args.owner then
+        if C.dialogueSnapshot(d) ~= args.snapshot or args.expect ~= pick.text then
+            error("the exact dialogue or answer changed; read dialogue again")
+        end
+        if C.rollVisible() ~= false then error("cannot confirm the dice window is closed") end
+    end
     local cmd = get(function() return dc.SelectAnswerCommand end)
     if not cmd then error("the dialogue cannot be answered right now") end
-    if get(function() return cmd:CanExecute(pick.vm) end) == false then
+    local can = get(function() return cmd:CanExecute(pick.vm) end)
+    if can == false or (args.owner and (can ~= true
+        or get(function() return d.ShowAnswers end) ~= true
+        or get(function() return pick.vm.Enabled end) ~= true)) then
         error("the game does not accept an answer right now")
     end
     local ok, err = pcall(function() cmd:Execute(pick.vm) end)
@@ -290,13 +337,58 @@ end
 
 local function rollDC()
     local kids = get(function() return Ext.UI.GetRoot():Find("ContentRoot").Children end)
+    if not kids then return nil, nil end
+    local visible
     for _, w in ipairs(items(kids)) do
-        if get(function() return w.Name end) == "ActiveRoll"
-            and tostring(get(function() return w.Visibility end)) == "Visible" then
-            return get(function() return w.DataContext end)
+        if get(function() return w.Name end) == "ActiveRoll" then
+            local state = tostring(get(function() return w.Visibility end))
+            if state == "Visible" then
+                if visible then return nil, nil end
+                visible = w
+            elseif state ~= "Hidden" and state ~= "Collapsed" then
+                return nil, nil
+            end
         end
     end
-    return nil
+    if not visible then return nil, false end
+    return get(function() return visible.DataContext end), true
+end
+
+function C.rollVisible()
+    local _, visible = rollDC()
+    return visible
+end
+
+function C.checkAnswerer(dc, d, owner)
+    local shown = get(function() return dc.CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.ActiveDialogue end)
+    local id = get(function() return d.DialogInstanceID end)
+    local speaker = answerer(d)
+    if not id or get(function() return shown.DialogInstanceID end) ~= id
+        or type(speaker) ~= "string" or speaker:sub(-36):lower() ~= owner then
+        error("cannot verify the visible dialogue and its answering character")
+    end
+end
+
+function C.dialogueSnapshot(d)
+    local speaker, line = lastLine(d)
+    local snap = { tostring(get(function() return d.DialogInstanceID end)), speaker or "", line or "" }
+    for _, a in ipairs(answerList(d)) do
+        snap[#snap + 1] = { a.text, a.disabled == true }
+    end
+    return Ext.Json.Stringify(snap)
+end
+
+function C.checkRoll(r, args)
+    if not args.roll_id then return end
+    local dc = widgetDC()
+    local d = dc and findDialogue(dc, args.instance)
+    if not d then error("the authorised dialogue is no longer visible") end
+    C.checkAnswerer(dc, d, args.owner)
+    local id = get(function() return r.Roll.RollUuid end) or get(function() return r.RollUuid end)
+        or get(function() return r.Roll.RollUUID end) or get(function() return r.RollUUID end)
+    if type(id) ~= "string" or id:lower() ~= args.roll_id then
+        error("cannot match the dice window to this character's dialogue check")
+    end
 end
 
 local ROLL_STATE = { WaitForStart = "waiting", WaitForReRoll = "waiting", StartRoll = "rolling",
@@ -314,7 +406,8 @@ local function rollInfo(r)
         out.natural = get(function() return r.RolledNumber1 end)
         -- ResultNumber has the bonuses (Guidance...) added; FinalResult is the die
         out.total = get(function() return r.ResultNumber end) or get(function() return r.FinalResult end)
-        out.success = get(function() return r.Success end) == true
+        local success = get(function() return r.Success end)
+        if type(success) == "boolean" then out.success = success end
     end
     out.inspiration = get(function() return r.InspirationPoints end)
     return out
@@ -337,9 +430,10 @@ local function rollBoosts(r)
     return out
 end
 
-function C.ops.roll_state()
+function C.ops.roll_state(args)
     local r = rollDC()
     if not r then return { open = false } end
+    C.checkRoll(r, args)
     local info = rollInfo(r)
     if info.state == "waiting" then
         local list = {}
@@ -355,10 +449,12 @@ end
 function C.ops.roll_boost(args)
     local r = rollDC()
     if not r then error("no dice roll is on screen") end
+    C.checkRoll(r, args)
+    if args.roll_id and rollInfo(r).state ~= "waiting" then error("dice are not waiting for a bonus") end
     local cmd = get(function() return r.AddModifierCommand end)
     local added = {}
     for _, b in ipairs(rollBoosts(r)) do
-        if b.owner == args.owner and not b.selected and cmd then
+        if type(b.owner) == "string" and b.owner:sub(-36):lower() == args.owner and not b.selected and cmd then
             if pcall(function() cmd:Execute(b.vm) end) then added[#added + 1] = b.name or b.spell end
         end
     end
@@ -373,6 +469,7 @@ local ROLL_STEP = { throw = "UserTriggeredNextPhaseCommand", reroll = "RollAgain
 function C.ops.roll(args)
     local r = rollDC()
     if not r then error("no dice roll is on screen") end
+    C.checkRoll(r, args)
     local info = rollInfo(r)
     local step = args.step or "throw"
     local name = ROLL_STEP[step]
@@ -381,8 +478,14 @@ function C.ops.roll(args)
     if step == "reroll" and not (info.state == "done" and not info.success and (info.inspiration or 0) > 0) then
         return info
     end
+    if args.roll_id and step == "continue" and (info.state ~= "done" or not info.natural or not info.total or info.success == nil) then
+        error("the dice result is not ready")
+    end
     local cmd = get(function() return r[name] end)
     if not cmd then error("the dice cannot be used right now") end
+    if args.roll_id and get(function() return cmd:CanExecute(nil) end) ~= true then
+        error("the game does not accept that dice action right now")
+    end
     local ok, err = pcall(function() cmd:Execute(nil) end)
     if not ok then error("roll failed: " .. tostring(err)) end
     return info
@@ -814,6 +917,39 @@ end
 
 local function push(text, shown)
     local lower = text:lower()
+    local protagonist = lower:match("^/protagonist%s+(%a+)%s*$")
+    local stop = lower == "/pause" or lower == "/stop" or lower == "/wait"
+        or lower == "stop" or lower == "pause" or lower == "wait" or lower == "wait for me"
+        or lower:match("^%[button%] stop") or lower:match("^%[button%] wait")
+        or lower:match("^%[button%] follow")
+        or text == "暂停" or text == "停下" or text == "停止" or text == "等待" or text == "等我"
+    if protagonist == "on" then
+        echo(shown or text)
+        if not C.controlLive() or not C.controlEpoch then
+            C.consentError = "本地控制器未就绪，请等 F10 显示桥接已连接"
+            addMessage({ kind = "note", text = "授权失败：" .. C.consentError, at = clockText() })
+        elseif not (C.controlTicket and not C.requestedOff) then
+            C.consentSeq = (C.consentSeq or 0) + 1
+            C.pendingConsent = { id = C.consentSeq, session = C.controlSession, epoch = C.controlEpoch }
+            C.consentError = nil
+        end
+        return
+    elseif protagonist and protagonist ~= "off" then
+        addMessage({ kind = "note", text = "/protagonist on | /protagonist off", at = clockText() })
+        return
+    end
+    if protagonist == "off" then
+        C.pendingConsent, C.consentError = nil, nil
+        C.requestedOff = C.controlSession
+        C.blockControl()
+        echo(shown or text)
+    end
+    if (protagonist or stop) and C.controlLive() and Ext.ClientNet and Ext.ClientNet.PostMessageToServer then
+        C.blockControl()
+        pcall(Ext.ClientNet.PostMessageToServer, "BG3COOP_LocalControl",
+            C.controlSession .. ":" .. (protagonist or "stop"))
+    end
+    if protagonist then return end
     local control = text:sub(1, 1) == "/" or text:sub(1, 8) == "[button]"
         or lower == "stop" or lower == "pause" or lower == "wait"
         or text == "暂停" or text == "停下" or text == "停止" or text == "等待" or text == "等我"
@@ -915,7 +1051,16 @@ local function buildPanel()
     local log, input = buildChat(chatTab)
     local actTab = tabs:AddTabItem(T("actions"))
     local recent = actTab:AddChildWindow("recent")
-    C.panel = { win = w, log = log, input = input, head = h, recent = recent }
+    local modeTab = tabs:AddTabItem("Protagonist / 主角")
+    local mode = modeTab:AddText("")
+    local modeDetail = modeTab:AddText("")
+    colored(modeTab:AddText("手动操作前先暂停或关闭接管。\nPause or disable before manual input."), "text", true)
+    local on = modeTab:AddButton("Enable / 启用接管")
+    on.OnClick = function() push("/protagonist on") end
+    local off = modeTab:AddButton("Disable / 关闭接管")
+    off.SameLine = true
+    off.OnClick = function() push("/protagonist off") end
+    C.panel = { win = w, log = log, input = input, head = h, recent = recent, mode = mode, modeDetail = modeDetail }
     w.OnHoverEnter = function() markRead() end
     showTitle(C.panel)
     C.showRecent()
@@ -998,6 +1143,20 @@ local function reveal(p)
 end
 
 function C.onTick()
+    if C.panel and C.panel.mode then
+        local label = "队友模式 / Companion Mode"
+        if C.consentError then
+            label = "授权失败 / Authorization failed"
+        elseif C.pendingConsent and C.controlLive() then
+            label = "等待授权确认 / Authorization pending"
+        elseif C.pendingConsent then
+            label = "授权失败，控制器未响应 / Controller did not respond"
+        elseif C.controlLive() and C.controlTicket and not C.requestedOff then
+            label = "主角接管已授权 / Protagonist authorized"
+        end
+        C.panel.mode.Text = label
+        C.panel.modeDetail.Text = C.consentError or ""
+    end
     pcall(C.recordDialogue)
     if C.splitWant then pcall(C.answerSplit) end
     local h = C.tradeHide
@@ -1310,10 +1469,56 @@ end
 function C.ops.ping() return { version = C.VERSION } end
 function C.ops.lang() return C.lang() end
 
+-- Only the owning bridge can submit a protagonist UI request. Recheck local Pause/Off
+-- in the deferred callback itself, immediately before touching the native UI.
+function C.queueControlUI(key, ticket, op, args)
+    if not Ext.UI.Defer then error("safe deferred UI access is unavailable") end
+    C.controlResult = { key = key, untilAt = Ext.Utils.MonotonicTime() + 2000 }
+    Ext.UI.Defer(function()
+        local slot = C.controlResult
+        if not slot or slot.key ~= key then return end
+        local ok, value = pcall(function()
+            if not C.controlLive() or C.controlBlocked or ticket ~= C.controlTicket
+                or Ext.Utils.MonotonicTime() >= slot.untilAt then
+                error("local protagonist UI permission changed")
+            end
+            if op == "dialogue" then
+                local result = C.ops.dialogue(args)
+                local dc = widgetDC()
+                local d = dc and findDialogue(dc, args.instance)
+                local owned = d and pcall(C.checkAnswerer, dc, d, args.owner)
+                result.verified = owned == true
+                if owned and get(function() return d.ShowAnswers end) == true then
+                    result.snapshot = C.dialogueSnapshot(d)
+                end
+                local dice = C.rollVisible()
+                result.dice_visible = dice
+                result.dice_unknown = dice == nil or nil
+                return result
+            end
+            return C.ops[op](args)
+        end)
+        slot.reply = Ext.Json.Stringify(ok and { ok = true, result = value }
+            or { ok = false, error = tostring(value) })
+    end)
+end
+
+function C.takeControlUI(key)
+    local slot = C.controlResult
+    if not slot or slot.key ~= key then return "cancelled" end
+    if not slot.reply then return "pending" end
+    C.controlResult = nil
+    return slot.reply
+end
+
 function C.rpc(json)
     local ok, req = pcall(Ext.Json.Parse, json)
     if not ok or type(req) ~= "table" then
         return Ext.Json.Stringify({ ok = false, error = "bad request" })
+    end
+    if C.controlTicket and (req.op == "choose" or req.op == "roll" or req.op == "roll_boost"
+        or req.op == "trade_item" or req.op == "trade_hide" or req.op == "trade_close") then
+        return Ext.Json.Stringify({ ok = false, error = "use the guarded local protagonist UI" })
     end
     local fn = C.ops[req.op]
     if not fn then return Ext.Json.Stringify({ ok = false, error = "unknown op " .. tostring(req.op) }) end

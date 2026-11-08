@@ -45,6 +45,7 @@ class FakeGame:
     def __init__(self) -> None:
         self.server = self._runtime(with_world=True)
         self.client = self._runtime(with_world=False)
+        self.client.globals().PY_client_net = self._client_net
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen()
@@ -76,6 +77,10 @@ class FakeGame:
     @property
     def world(self):
         return self.server.globals().MOCK
+
+    def _client_net(self, channel, payload, peer=0):
+        listener = self.world.net[channel]
+        listener(channel, payload, peer)
 
     # ---- protocol ----
 

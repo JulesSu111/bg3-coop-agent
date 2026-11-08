@@ -340,9 +340,10 @@ def test_use_tells_what_appeared_or_where_it_took_you(env):
     assert r["moved_m"] > 100 and "taken somewhere else" in r["effect"], r
 
 
-def _check_on_screen(fake, s, throws):
+def _check_on_screen(fake, s, throws, setup_companion=True):
     """Shadowheart's dialogue with an Investigation check (DC 11, +5) waiting for its dice."""
-    s.set_agent("Shadowheart")
+    if setup_companion:
+        s.set_agent("Shadowheart")
     fake.server.execute("MOCK.dialog[MOCK.sh:sub(-36)] = 9")
     fake.client.execute("MOCK_C.throws = { " + ", ".join(map(str, throws)) + " }")
     fake.client.execute("""
@@ -656,7 +657,7 @@ class _Panel:
         self.win = wins[len(wins)]
         kids = list(self.win.Children.values())
         self.state, self.turn = kids[:2]
-        chat, actions = list(kids[3].Children.values())
+        chat, actions = list(kids[3].Children.values())[:2]
         self.log, table, self.input, self.send = list(chat.Children.values())
         cells = table.Children[1].Children.values()
         self.buttons = [c.Children[1] for c in cells]
@@ -2442,3 +2443,237 @@ def test_a_jump_goes_straight_there_within_reach(env):
     # the cast checks stay off, or the game walks her about before jumping
     assert fake.server.eval("MOCK.castOptions[#MOCK.castOptions].IgnoreCastChecks") is True
     assert "moved_m" not in r["result"] and "why_moved" not in r["result"], r
+
+
+# ---- Local protagonist takeover -------------------------------------------------------------
+
+def _grant_protagonist(fake, s):
+    s.game.refresh_control(6000)
+    s.game.call("local_inbox", context="client")
+    _type(fake, "/protagonist on")
+    return s.game.refresh_control(6000)
+
+
+def _task_authority(monkeypatch, game, state):
+    authority = {k: state[k] for k in ("epoch", "revision", "ticket")}
+    monkeypatch.setattr(game, "_local_guard", lambda: authority, raising=False)
+    return authority
+
+
+def test_protagonist_consent_and_multiplayer_reservations(env, monkeypatch):
+    from bg3coop.game import GameError
+
+    fake, s = env
+    g = s.game
+    assert "error" in s.set_agent("Tav", human="Shadowheart")
+    assert "error" in s.set_agent("Tav")
+    assert s.set_agent("Shadowheart")["name"] == "Shadowheart"
+    g.refresh_control(6000)
+    fake._client_net("BG3COOP_LocalControl", g.connection_id + ":on", peer=0x10000)
+    fake._client_net("BG3COOP_LocalControl", g.connection_id + ":on", peer=0)
+    assert "ticket" not in g.refresh_control(6000)
+    with pytest.raises(GameError, match="unknown op"):
+        g.call("controlHeartbeat", {"ticket": "forged"})
+    fake.server.execute("MOCK.selected = MOCK.sh")  # stable host avatar, even with a companion selected
+    g.call("local_inbox", context="client")
+    fake.client.execute("local w = MOCK_C.panel(); w.Children[4].Children[3].Children[4].OnClick()")
+    state = g.refresh_control(6000)
+    assert state["ticket"] and state["id"] == fake.world.host
+    assert not fake.world.detached[SH]
+    assert g.call("local_inbox", context="client")["messages"] == []
+    assert g.call("status")["control_mode"] == "protagonist"
+    assert "error" in s.set_agent("Tav", human="Shadowheart")
+    with pytest.raises(GameError, match="Free Explore"):
+        g.call("move", {"dir": "E"})
+    _task_authority(monkeypatch, g, state)
+    with pytest.raises(GameError, match="regroup"):
+        g.call("regroup")
+    with pytest.raises(GameError, match="follow"):
+        g.call("move", {"to_human": True})
+    assert not fake.world.detached[fake.world.host[-36:]]
+    monkeypatch.setattr(g, "_local_guard", None)
+    _type(fake, "/protagonist off")
+    fake.server.execute(f"MOCK.reserved = {{ ['{SH}'] = 65537 }}; MOCK.selected = MOCK.host")
+    assert "error" in s.set_agent("Shadowheart")
+    fake.server.execute(f"MOCK.reserved['{SH}'] = 1; MOCK.avatars = {{ {{ MOCK.host }}, {{ MOCK.sh }} }}")
+    assert "error" in s.set_agent("Shadowheart")
+    fake.server.execute("MOCK.avatars = nil")
+    assert s.set_agent("Shadowheart")["name"] == "Shadowheart"
+
+
+@pytest.mark.parametrize("interrupt", ["off", "pause", "lease", "connection", "load", "client_load"])
+def test_protagonist_jobs_and_old_tickets_are_cancelled(env, monkeypatch, interrupt):
+    from bg3coop.game import GameError
+
+    fake, s = env
+    g = s.game
+    state = _grant_protagonist(fake, s)
+    _task_authority(monkeypatch, g, state)
+    started = g.call("move", {"pos": [12, 0, 2]})
+    if interrupt in {"off", "pause"}:
+        _type(fake, "/protagonist off" if interrupt == "off" else "/pause")
+    elif interrupt == "lease":
+        fake.server.execute("BG3COOP.controlUntil = 0")
+        fake.server.execute("for _, fn in ipairs(MOCK.subs.Tick) do fn() end")
+    elif interrupt == "connection":
+        g.close()
+    elif interrupt == "load":
+        fake.server.execute("for _, fn in ipairs(MOCK.subs.SessionLoading) do fn() end")
+    else:
+        fake.client.execute("BG3COOP_C = nil")
+
+    # Player actions above take effect before the daemon polls, except that a
+    # disconnected debugger is discovered at the next handshake or lease expiry.
+    if interrupt in {"off", "pause", "lease", "load"}:
+        with pytest.raises(GameError, match="changed"):
+            g.call("job", {"id": started["job"]})
+    monkeypatch.setattr(g, "_local_guard", None)
+    state = g.refresh_control(6000)
+    assert bool(state.get("ticket")) == (interrupt == "pause")
+    if interrupt == "pause":
+        _task_authority(monkeypatch, g, state)
+    assert g.call("job", {"id": started["job"]})["status"] == "cancelled"
+    assert fake.world.purged == fake.world.host[-36:]
+
+
+def _protagonist_dialogue(fake, owner):
+    _dialogue_on_screen(fake)
+    fake.server.execute("MOCK.dialog[MOCK.sh:sub(-36)] = nil; MOCK.dialog[MOCK.host:sub(-36)] = 9")
+    fake.client.execute(f'''
+        local d, dc = MOCK_C.dlg, MOCK_C.dlgDC
+        d.ShowAnswers = true
+        d.AvailableSpeakers = {{{{ EntityUUID = "{owner}" }}}}
+        d.Answers = {{{{ BodyText = "Where are we?", Enabled = true }}, {{ BodyText = "[Attack] Charge.", Enabled = true }}}}
+        dc.CurrentPlayer = {{ SelectedCharacter = {{ PlayerCharacterProperties = {{ ActiveDialogue = d }} }} }}
+        dc.SelectAnswerCommand.CanExecute = function() return true end
+    ''')
+
+
+def test_protagonist_choice_confirms_risk_and_rechecks_visible_answer(env, monkeypatch):
+    fake, s = env
+    state = _grant_protagonist(fake, s)
+    _task_authority(monkeypatch, s.game, state)
+    _protagonist_dialogue(fake, SH)
+    assert not s.dialogue()["yours"]
+    assert "error" in s.choose(1, expect="Where are we?", routine=True)
+    assert fake.client.eval("MOCK_C.answered") is None
+    _protagonist_dialogue(fake, fake.world.host[-36:])
+    assert s.dialogue()["yours"]
+    assert s.choose(1, expect="Where are we?", routine=True)["chose"] == "Where are we?"
+    asked = []
+    monkeypatch.setattr(s.chat, "ask", lambda q, _: asked.append(q) or {"answer": "no"})
+    assert s.choose(2, expect="[Attack] Charge.", routine=True)["declined"]
+    assert "[Attack] Charge." in asked[0]
+    assert fake.client.eval("MOCK_C.answered") == "Where are we?"
+
+    def reply_after_change(question, timeout):
+        fake.client.execute('MOCK_C.dlg.Answers[2].BodyText = "Leave."')
+        return {"answer": "yes"}
+
+    monkeypatch.setattr(s.chat, "ask", reply_after_change)
+    assert "error" in s.choose(2, expect="[Attack] Charge.")
+    assert fake.client.eval("MOCK_C.answered") == "Where are we?"
+    monkeypatch.setattr(s.chat, "ask", lambda *_: {"answer": "yes"})
+    assert s.choose(2, expect="Leave.")["chose"] == "Leave."
+
+
+def test_protagonist_roll_matches_native_window_actor_and_instance(env, monkeypatch):
+    fake, s = env
+    state = _grant_protagonist(fake, s)
+    _task_authority(monkeypatch, s.game, state)
+    _check_on_screen(fake, s, [9], setup_companion=False)
+    fake.server.execute('''
+        local me = Ext.Entity.Get(MOCK.host)
+        MOCK.dialog[MOCK.host:sub(-36)] = 9
+        Ext.Entity.Get = (function(old)
+            return function(id) if id == MOCK.host:sub(-36) then return me end return old(id) end
+        end)(Ext.Entity.Get)
+        MOCK.requestedRoll = { DialogId = 10, Roller = me, RollUuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }
+        Ext.System.ServerRoll = { EntityToRollEntity = { [me] = { RequestedRoll = MOCK.requestedRoll } } }
+    ''')
+    fake.client.execute(f'''
+        local dc, roll = MOCK_C.root:Find().Children[1].DataContext, MOCK_C.rollWidget.DataContext
+        local d = dc.Data.Dialogues[1]
+        d.AvailableSpeakers = {{{{ EntityUUID = "{fake.world.host[-36:]}" }}}}
+        dc.CurrentPlayer = {{ SelectedCharacter = {{ PlayerCharacterProperties = {{ ActiveDialogue = d }} }} }}
+        roll.Roll.RollUuid = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
+        roll.UserTriggeredNextPhaseCommand.CanExecute = function() return true end
+        roll.ContinueCommand.CanExecute = function() return true end
+    ''')
+    assert "error" in s.roll()
+    fake.server.execute("MOCK.requestedRoll.DialogId = 9")
+    assert "error" in s.roll()
+    assert fake.client.eval("#MOCK_C.throws") == 1
+    fake.client.execute('MOCK_C.rollWidget.DataContext.Roll.RollUuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"')
+    assert s.dialogue()["roll"]["state"] == "waiting"
+    assert s.roll()["success"] is True
+    assert fake.client.eval("MOCK_C.rollWidget.Visibility") == "Hidden"
+
+
+def test_player_off_blocks_already_deferred_choice(env, monkeypatch):
+    fake, s = env
+    state = _grant_protagonist(fake, s)
+    _task_authority(monkeypatch, s.game, state)
+    _protagonist_dialogue(fake, fake.world.host[-36:])
+    fake.client.execute('''
+        local d = MOCK_C.dlg
+        local args = { owner = d.AvailableSpeakers[1].EntityUUID, instance = 9, n = 1,
+            expect = "Where are we?", snapshot = BG3COOP_C.dialogueSnapshot(d) }
+        MOCK_C.holdUI = true
+        BG3COOP_C.queueControlUI("pending", BG3COOP_C.controlTicket, "choose", args)
+    ''')
+    _type(fake, "/protagonist off")
+    fake.client.execute("MOCK_C.deferred()")
+    assert fake.client.eval("MOCK_C.answered") is None
+
+
+def test_panel_grants_solo_avatar_without_network_delivery(env):
+    fake, s = env
+    g = s.game
+    # SE's local network sender can differ from the host character's reserved user.
+    # The game may also lack a party row for a lone host avatar.
+    fake.server.execute("""
+        MOCK.reserved = { [MOCK.host:sub(-36)] = 131073 }
+        Osi.DB_PartyMembers.Get = function() return {} end
+        Ext.RegisterNetListener = nil
+    """)
+    fake.client.execute('Ext.ClientNet.PostMessageToServer = function() error("network unavailable") end')
+    before = g.refresh_control(6000)
+    assert not before.get("id") and not before.get("ticket")
+    g.call("local_inbox", context="client")
+    fake.client.execute("local w = MOCK_C.panel(); w.Children[4].Children[3].Children[4].OnClick(); MOCK_C.fire('Tick')")
+    assert "等待授权确认" in fake.client.eval("BG3COOP_C.panel.mode.Text")
+    assert g.call("local_inbox", context="client")["messages"] == []
+    state = g.refresh_control(6000)
+    assert state["ticket"] and state["id"] == fake.world.host
+    assert g.call("status")["id"] == fake.world.host
+    assert fake.server.eval("#MOCK.subs.Tick") > 0
+    fake.client.execute("MOCK_C.fire('Tick')")
+    assert "主角接管已授权" in fake.client.eval("BG3COOP_C.panel.mode.Text")
+    _type(fake, "/protagonist off")
+    assert not g.refresh_control(6000).get("ticket")
+
+
+def test_consent_failure_reports_avatar_lookup_reason(env):
+    fake, s = env
+    g = s.game
+    fake.server.execute("MOCK.avatars = {}")
+    state = _grant_protagonist(fake, s)
+    assert not state.get("id") and not state.get("ticket")
+    assert "没有可核实归属" in state["consent"]["error"]
+    fake.client.execute("MOCK_C.fire('Tick')")
+    assert "授权失败" in fake.client.eval("BG3COOP_C.panel.mode.Text")
+    assert fake.client.eval("BG3COOP_C.panel.modeDetail.Text") == state["consent"]["error"]
+    assert "consent" not in g.refresh_control(6000)
+
+
+def test_unanswered_consent_does_not_replay_on_reconnect(env):
+    fake, s = env
+    g = s.game
+    g.refresh_control(6000)
+    _type(fake, "/protagonist on")
+    g.close()
+    state = g.refresh_control(6000)
+    assert not state.get("ticket")
+    assert "连接已变更" in state["consent"]["error"]
+    assert not g.refresh_control(6000).get("ticket")

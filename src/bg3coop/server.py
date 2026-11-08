@@ -1000,7 +1000,7 @@ def roll(reroll_if_failed: bool = False, use_boosts: bool = False) -> Any:
 
 @mcp.tool()
 @_safe
-def choose(n: int, why: str = "", expect: str = "") -> Any:
+def choose(n: int, why: str = "", expect: str = "", routine: bool = False) -> Any:
     """Pick answer number `n` in YOUR character's conversation. `why`: one short sentence, in the
     human's language, on why you pick it; the chat panel shows the answer and the reason, so the
     human can follow. `expect` (a few words of its text) guards against the options having changed."""
@@ -1010,8 +1010,24 @@ def choose(n: int, why: str = "", expect: str = "") -> Any:
         return {"error": "your character is not in a conversation; leave the human's dialogues to them"}
     if not mine.get("yours"):
         return {"error": "this conversation belongs to the human; leave it to them"}
-    r = game.call("choose", {"n": n, "expect": expect, "instance": mine["instance"], "as": st.get("name")},
-                  context="client")
+    args = {"n": n, "expect": expect, "instance": mine["instance"], "as": st.get("name")}
+    if st.get("control_mode") == "protagonist":
+        args.update(dialogues.ui_args(st))
+        shown = game.protagonist_ui("dialogue", args)
+        option = next((a for a in shown.get("answers") or [] if a["n"] == n), None)
+        if (not shown.get("snapshot") or shown.get("dice_visible") or shown.get("dice_unknown")
+                or not option or option.get("disabled")):
+            return {"error": "no verified answer is available in the protagonist's visible dialogue"}
+        if option["text"] != expect:
+            return {"error": "read dialogue and pass the full exact option text as expect"}
+        args["snapshot"] = shown["snapshot"]
+        if not routine or dialogues.possibly_irreversible(expect):
+            reply = chat.ask(f"Choose this exact response?\n{expect}\n{why.strip()[:200]}", 45)
+            if reply.get("answer") != "yes":
+                return {"declined": True, "note": "No explicit approval; no answer was selected."}
+        r = game.protagonist_ui("choose", args)
+    else:
+        r = game.call("choose", args, context="client")
     game.chat_post(dialogues.choice_line(game, r["chose"], why))
     return r
 

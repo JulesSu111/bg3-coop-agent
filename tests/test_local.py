@@ -17,7 +17,7 @@ CONFIG = {"codex": "fake", "task_timeout": 0.15, "tool_timeout": 0.1,
 
 
 class Game:
-    agent_id = human_id = agent_name = None
+    agent_id = human_id = agent_name = connection_id = None
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -41,6 +41,12 @@ class Game:
         if op == "local_ack":
             self.messages = [m for m in self.messages if m["id"] > args["id"]]
         return {}
+
+    def refresh_control(self, lease_ms):
+        return {"epoch": self.epoch, "revision": 0}
+
+    def suspend_control(self, revoke=False):
+        self.calls.append("stop")
 
     def chat_post(self, text, kind="note"):
         self.posts.append(text)
@@ -83,6 +89,7 @@ class App:
 
 def controller(tmp_path):
     game = Game()
+    game.agent_id = "test-companion"
     async def tools():
         return [SimpleNamespace(name="move", description="move", input_schema={}),
                 SimpleNamespace(name="status", description="status", input_schema={})]
@@ -154,11 +161,11 @@ def test_waiting_gate_and_pause_resume(tmp_path):
     async def run():
         c = controller(tmp_path)
         c.ready = True
-        c.active = 1
+        c.active, c.turn = 1, "current-turn"
         c.tools = {"move": True, "status": True}
         with pytest.raises(PermissionError, match="Waiting"):
-            await c.tool_request("item/tool/call", {"tool": "bg3_move"})
-        result = await c.tool_request("item/tool/call", {"tool": "bg3_status"})
+            await c.tool_request("item/tool/call", {"tool": "bg3_move", "turnId": c.turn})
+        result = await c.tool_request("item/tool/call", {"tool": "bg3_status", "turnId": c.turn})
         assert result["success"]
         await c.command("/pause", "pause")
         assert c.mode == "paused" and c.active is None
@@ -315,3 +322,165 @@ def test_mcp_and_doctor_share_real_debugger_and_agent_restore(monkeypatch, tmp_p
         bridge.shutdown()
         bridge.server_close()
         owner.close()
+
+
+@pytest.mark.parametrize("action", ["pause", "timeout", "reconnect"])
+def test_stale_tool_thread_is_fenced(tmp_path, action):
+    from bg3coop.game import GameError
+
+    async def run():
+        c = controller(tmp_path)
+        c.ready, c.mode = True, "free"
+        c.game.connection_id = "connection-1"
+        c.active, c.turn = 1, "current"
+        c.control_ticket = "protagonist-ticket"
+        c.tools = {"move": True}
+        started, release, exited = threading.Event(), threading.Event(), threading.Event()
+        stale_errors = []
+
+        def move():
+            c.guard()
+            started.set()
+            try:
+                assert release.wait(2)
+                c.guard()
+            except GameError as exc:
+                stale_errors.append(str(exc))
+            finally:
+                exited.set()
+
+        c.srv.move = move
+        pending = asyncio.create_task(c.tool_request("item/tool/call", {"tool": "bg3_move", "turnId": "current"}))
+        assert await asyncio.to_thread(started.wait, 1)
+        try:
+            if action == "pause":
+                await c.command("/pause", "pause")
+            elif action == "timeout":
+                with pytest.raises(TimeoutError, match="游戏工具超时"):
+                    await pending
+            else:
+                c.game.connection_id = "connection-2"
+        finally:
+            release.set()
+        assert await asyncio.to_thread(exited.wait, 1)
+        if action != "timeout":
+            await pending
+        assert stale_errors and "stale" in stale_errors[0]
+        if action != "reconnect":
+            assert "stop" in c.game.calls
+
+    asyncio.run(run())
+
+
+def test_takeover_requires_free_explore_and_is_not_persisted(tmp_path):
+    async def run():
+        c = controller(tmp_path)
+        c.mode = "free"
+        c.game.agent_id = "local-avatar"
+        state = {"epoch": c.game.epoch, "revision": 1, "ticket": "ticket", "grant": "grant"}
+        c.game.refresh_control = lambda _: state
+        await c.poll()
+        assert c.ready and c.mode == "waiting" and c.worker is None
+        assert c.queue.get("identity") == {}
+        await c.command("/free", "free")
+        assert c.mode == "free" and c.queue.get("mode") == "waiting"
+        await c.poll()
+        await c.worker
+        assert App.turns == 1
+        state.update(revision=2, ticket=None, grant=None)
+        c.game.agent_id = None
+        await c.poll()
+        assert c.ready and c.mode == "waiting" and c.worker is None
+
+    asyncio.run(run())
+
+
+def test_no_role_blocks_autonomous_wakes_and_plain_chat_cannot_grant(tmp_path):
+    async def run():
+        c = controller(tmp_path)
+        c.game.agent_id = None
+        c.mode = "free"
+        c.game.messages = [{"id": 1, "text": "/protagonist on"}, {"id": 2, "text": "/free"}]
+        c.game.events = [{"seq": 1, "kind": "your_turn"}]
+        await c.poll()
+        assert c.control_ticket is None and c.mode == "waiting"
+        assert any("没有已绑定的控制角色" in line for line in c.game.posts)
+        for _ in range(3):
+            await c.poll()
+        assert App.starts == App.turns == 0 and c.worker is None
+
+    asyncio.run(run())
+
+
+def test_paused_controller_accepts_consent_but_requires_resume(tmp_path):
+    async def run():
+        c = controller(tmp_path)
+        c.mode = "paused"
+        c.game.agent_id = "host-avatar"
+        c.game.refresh_control = lambda _: {"epoch": c.game.epoch, "revision": 1, "ticket": "t", "grant": "g",
+                                            "name": "烬誓", "consent": {"id": 1}}
+        c.game.messages = [{"id": 1, "text": "/free"}]
+        await c.poll()
+        assert c.control_ticket == "t" and c.mode == "paused" and c.worker is None and App.turns == 0
+        assert any("主角接管已授权：烬誓" in line and "暂停" in line for line in c.game.posts)
+        await c.command("/resume", "resume")
+        assert c.mode == "waiting"
+        await c.command("/free", "free")
+        await c.poll()
+        await c.worker
+        assert App.turns == 1
+
+    asyncio.run(run())
+
+
+def test_debugger_handshake_timeout_throttles_new_connections(monkeypatch):
+    from bg3coop import game as game_module
+
+    attempts = []
+    clock = [10.0]
+
+    class BusyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def connect(self):
+            attempts.append(clock[0])
+            raise TimeoutError("no handshake")
+
+    monkeypatch.setattr(game_module, "RemoteLua", BusyClient)
+    monkeypatch.setattr(game_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.delenv("BG3COOP_SSH_HOST", raising=False)
+    game = game_module.Game()
+    with pytest.raises(game_module.DebuggerBusy):
+        game._connect()
+    clock[0] += game_module.DEBUGGER_RETRY_SECONDS - 1
+    with pytest.raises(game_module.DebuggerBusy):
+        game._connect()
+    assert attempts == [10.0]
+    clock[0] += 1
+    with pytest.raises(game_module.DebuggerBusy):
+        game._connect()
+    assert attempts == [10.0, clock[0]]
+
+
+def test_busy_debugger_is_logged_without_starting_the_model(tmp_path, caplog):
+    from bg3coop.game import DEBUGGER_RETRY_SECONDS, DebuggerBusy
+
+    async def run():
+        c = controller(tmp_path)
+        real_eval = c.game.eval
+
+        def busy(*args):
+            raise DebuggerBusy("port 9998 handshake timed out")
+
+        c.game.eval = busy
+        await c.poll()
+        await c.poll()
+        assert not c.ready and App.starts == 0
+        assert c.sleep_interval >= DEBUGGER_RETRY_SECONDS
+        assert caplog.text.count("F10 面板可能无法创建") == 1
+        c.game.eval = real_eval
+        await c.poll()
+        assert c.ready and not c.debugger_busy
+
+    asyncio.run(run())

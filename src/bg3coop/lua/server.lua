@@ -10,7 +10,7 @@
 
 BG3COOP = BG3COOP or {}
 local C = BG3COOP
-C.VERSION = 93
+C.VERSION = 95
 
 local function now() return Ext.Utils.MonotonicTime() end
 
@@ -159,6 +159,44 @@ local function human()
     return nil
 end
 
+-- Avatar and reservation checks are independent of the optional set_agent human label.
+function C.avatars()
+    local ok, rows = pcall(function() return Osi.DB_Avatars:Get(nil) end)
+    return ok and rows or nil
+end
+
+function C.hostAvatar()
+    local host = osi(Osi.GetHostCharacter)
+    if not host or not entity(host) then return nil, "游戏没有返回本机主持者角色" end
+    local user = osi(Osi.GetReservedUserID, host)
+    if type(user) ~= "number" or user < 0 then return nil, "无法核实本机主持者的角色归属" end
+    local avatars = C.avatars()
+    if not avatars then return nil, "游戏没有返回玩家化身列表（DB_Avatars）" end
+    local avatar
+    for _, row in ipairs(avatars) do
+        local id = row[1]
+        if (same(id, host) or isParty(id)) and entity(id) and osi(Osi.GetReservedUserID, id) == user then
+            if avatar and not same(avatar, id) then return nil, "本机主持者有多个候选主角" end
+            avatar = id
+        end
+    end
+    if not avatar then return nil, "当前存档没有可核实归属本机主持者的主角" end
+    return avatar
+end
+
+function C.companionAllowed(id)
+    local avatars = C.avatars()
+    if not avatars then return false end
+    for _, row in ipairs(avatars) do
+        if same(id, row[1]) then return false end
+    end
+    local host = osi(Osi.GetHostCharacter)
+    local owner = osi(Osi.GetReservedUserID, id)
+    local localUser = host and osi(Osi.GetReservedUserID, host)
+    return type(owner) == "number" and type(localUser) == "number" and localUser >= 0
+        and (owner == -65536 or owner == localUser)
+end
+
 local function hp(uuid)
     local h = comp(entity(uuid), "Health")
     if h then
@@ -215,10 +253,15 @@ local function noteDialog(inst, startedByAgent)
     if not d then
         local h = human()
         local justActed = C.actedAt and now() - C.actedAt < AGENT_ACT_MS
-        d = { yours = startedByAgent or justActed or not (h and dialogHas(inst, h)) }
+        if C.protagonist then
+            -- The client must still prove the visible answerer is the granted avatar.
+            d = { yours = C.agent ~= nil and dialogOf(C.agent) == inst }
+        else
+            d = { yours = startedByAgent or justActed or not (h and dialogHas(inst, h)) }
+        end
         C.dialogs[inst] = d
         push("dialogue_started", { yours = d.yours })
-    elseif startedByAgent then
+    elseif startedByAgent and not C.protagonist then
         d.yours = true
     end
     return d
@@ -716,7 +759,7 @@ function C.ops.look(args)
         end
     end
     -- The human's character is always listed, wherever it is.
-    if h and not sawHuman then
+    if h and not same(h, me) and not sawHuman then
         local p = C.pos(h)
         if p then
             chars[#chars + 1] = { id = h, name = C.name(h), rel = "party", human = true, dist = r1(dist(mypos, p)),
@@ -945,10 +988,12 @@ function C.ops.party()
     local out = {}
     local h = human()
     local host = osi(Osi.GetHostCharacter)
+    local protagonist = C.hostAvatar()
     for _, p in ipairs(party()) do
         local hv, mh = hp(p)
         out[#out + 1] = { id = p, name = C.name(p), hp = hv, max_hp = mh,
             human = same(p, h) or nil, agent = same(p, C.agent) or nil,
+            protagonist = same(p, protagonist) or nil,
             selected_by_human = same(p, host) or nil }
     end
     return out
@@ -957,14 +1002,17 @@ end
 function C.ops.status()
     local me = agent()
     local s = sheet(me)
+    s.control_mode = C.protagonist and "protagonist" or nil
     local h = human()
-    if h then
+    if h and not same(me, h) then
         local hp_ = C.pos(h)
         s.human = { name = C.name(h), dist = hp_ and s.pos and r1(dist(s.pos, hp_)),
             dir = hp_ and s.pos and dir(s.pos, hp_), combat = inCombat(h) or nil, dialog = inDialog(h) or nil,
             downed = isDowned(h) or nil, dead = isDead(h) or nil }
     end
-    if same(osi(Osi.GetHostCharacter), me) then
+    if C.protagonist then
+        s.note = "Shared avatar: use Pause or disable takeover before entering manual gameplay input."
+    elseif same(osi(Osi.GetHostCharacter), me) then
         s.note = "the human has selected your character and may be controlling it right now"
     end
     s.region = osi(Osi.GetRegion, me)
@@ -1083,6 +1131,8 @@ end
 function C.ops.set_agent(args)
     local p = findMember(args.id) or findMember(args.name)
     if not p then error("no party member matches " .. tostring(args.name or args.id)) end
+    if C.protagonist then error("disable protagonist control in the local F10 panel first") end
+    if not C.companionAllowed(p) then error("cannot take over a human avatar or another user's character") end
     local h = findMember(args.human_id) or findMember(args.human)
     if (args.human or args.human_id) and not h then error("no party member matches " .. tostring(args.human)) end
     if not h and C.human and not same(C.human, p) then h = C.human end
@@ -1094,9 +1144,13 @@ function C.ops.set_agent(args)
     end
     if not h then error("cannot tell which character is the human's: pass human") end
     if same(p, h) then error("that is the human's own character") end
+    if C.agent and not same(C.agent, p) then C.releaseActor() end
     C.agent, C.human = p, h
     C.fallenInit = nil -- who is dead already is not news
-    if args.detach ~= false then osi(Osi.DetachFromPartyGroup, p) end
+    if args.detach ~= false then
+        if truthy(osi(Osi.InSamePartyGroup, p, h)) then C.detachedForControl = true end
+        osi(Osi.DetachFromPartyGroup, p)
+    end
     takeOverReactions(p)
     local n = C.name(p)
     push("agent_set", { name = n })
@@ -1106,7 +1160,9 @@ end
 function C.ops.regroup()
     local me = agent()
     local h = human()
+    if same(me, h) then error("protagonist mode has no separate character to regroup with") end
     osi(Osi.AttachToPartyGroup, me, h)
+    C.detachedForControl = nil
     C.leftGroupAt = nil
     if C.origReactions and same(C.origReactions.owner, me) then
         pcall(setReactions, me, C.origReactions.modes)
@@ -1323,7 +1379,7 @@ end
 
 function C.ops.cancel(args)
     local j = C.jobs[tonumber(args.id)]
-    if j then
+    if j and j.status == "running" then
         osi(Osi.PurgeOsirisQueue, j.me or C.agent)
         finish(j, "cancelled")
     end
@@ -1571,8 +1627,9 @@ local function setOff(j, me, target, within, how, plan)
     d.how = how or "Run"
     -- chained to the human (after regroup), the game walks the agent back to them once it stops
     local h = human()
-    if h and truthy(osi(Osi.InSamePartyGroup, me, h)) then
+    if h and not same(me, h) and truthy(osi(Osi.InSamePartyGroup, me, h)) then
         osi(Osi.DetachFromPartyGroup, me)
+        if same(me, C.agent) then C.detachedForControl = true end
         -- the group check lags a moment: a second walk right after is not news
         if not (C.leftGroupAt and now() - C.leftGroupAt < 5000) then d.unchained = true end
         C.leftGroupAt = now()
@@ -1676,6 +1733,7 @@ end
 
 function C.ops.move(args)
     local me = agent()
+    if args.to_human and C.protagonist then error("the protagonist cannot follow themselves") end
     local j = newJob("move")
     local target = args.id
     local within = tonumber(args.within)
@@ -2173,9 +2231,10 @@ end
 -- share items at any distance outside combat, as in the game's own UI.
 function C.ops.give(args)
     local me = agent()
-    local to = args.to and findMember(args.to) or human()
+    local to = args.to and findMember(args.to)
+    if not args.to and not C.protagonist then to = human() end
     if args.to and not to then error("no party member matches " .. tostring(args.to)) end
-    if not to then error("cannot tell who the human is") end
+    if not to then error("specify a different party member as recipient") end
     if same(to, me) then error("that is you") end
     if inCombat(me) then error("handing items over in combat is not supported; do it after the fight") end
     local given, skipped = {}, {}
@@ -2327,13 +2386,14 @@ end
 local function travelJob(me, go, result_fn)
     local j = newJob("travel", { started_in_combat = inCombat(me) })
     local h = human()
-    local unchained = h and truthy(osi(Osi.InSamePartyGroup, me, h)) or nil
+    local unchained = h and not same(me, h) and truthy(osi(Osi.InSamePartyGroup, me, h)) or nil
     local function start()
         go()
         j.data.wait_until = now() + 3000
     end
     if unchained then
         osi(Osi.DetachFromPartyGroup, me)
+        if same(me, C.agent) then C.detachedForControl = true end
         j.data.ready_fn = function() return not truthy(osi(Osi.InSamePartyGroup, me, h)) end
         j.data.go, j.data.not_ready = start, "could not unchain from the human's group"
     else
@@ -3190,8 +3250,9 @@ local DROP_OPTIONS = { IgnoreSpellRolls = true, IgnoreCastChecks = true }
 local CHECKED_DROP = { IgnoreSpellRolls = true, IgnoreCastChecks = true, IgnoreTargetChecks = true }
 
 local function playByTheRules(me, castId, opt, consumed)
-    local tries = 0
+    local tries, action = 0, C.actionRevision
     local function look()
+        if action ~= C.actionRevision then return end
         tries = tries + 1
         local found = false
         pcall(function()
@@ -3712,11 +3773,42 @@ function C.ops.end_turn()
     return r
 end
 
+function C.stopActions()
+    C.actionRevision = (C.actionRevision or 0) + 1
+    local actors = {}
+    if C.actor or C.agent then actors[C.actor or C.agent] = true end
+    for _, j in pairs(C.jobs) do
+        if j.status == "running" then
+            if j.me then actors[j.me] = true end
+            finish(j, "cancelled")
+        end
+    end
+    C.pending, C.striking, C.starting, C.actedAt = nil, nil, nil, nil
+    -- A companion can be reassigned by a multiplayer host between requests.
+    local host = C.hostAvatar()
+    if not C.agent or same(C.agent, host) or C.companionAllowed(C.agent) then
+        for me in pairs(actors) do osi(Osi.PurgeOsirisQueue, me) end
+    end
+end
+
 function C.ops.stop()
-    osi(Osi.PurgeOsirisQueue, agent())
-    for _, j in pairs(C.jobs) do finish(j, "cancelled") end
-    C.pending = nil
+    C.stopActions()
     return true
+end
+
+function C.releaseActor()
+    C.stopActions()
+    if C.detachedForControl and C.agent and C.human and not same(C.agent, C.human)
+        and C.companionAllowed(C.agent) then
+        osi(Osi.AttachToPartyGroup, C.agent, C.human)
+    end
+    C.detachedForControl = nil
+    if C.origReactions and C.companionAllowed(C.origReactions.owner) then
+        pcall(setReactions, C.origReactions.owner, C.origReactions.modes)
+    end
+    C.origReactions, C.actor, C.agent, C.human = nil, nil, nil, nil
+    C.dialogs, C.turn, C.fightId, C.fallenInit = {}, {}, nil, nil
+    C.leftGroupAt = nil
 end
 
 -- A modal message box on the human's screen, for what cannot wait. The bridge rate-limits this.
@@ -4494,6 +4586,172 @@ function C.summonOf(q)
     error("you have no summon " .. tostring(q) .. " (combat lists yours)")
 end
 
+-- The debugger owner binds the local client to a short-lived controller session.
+-- Only the host's local panel sends consent. None of these functions are RPC ops.
+do
+    local channel = "BG3COOP_LocalControl"
+    local read = {
+        party=true, status=true, look=true, sight=true, events=true, combat=true,
+        turn_check=true, dialogue=true, dialogue_roll=true, examine=true, inventory=true, spells=true, quests=true,
+        memory=true, notes_get=true, notes_put=true, ping=true, pointed=true,
+        stop=true,
+    }
+    local function revoke()
+        if not C.protagonist then return end
+        C.protagonist, C.protagonistGrant = nil, nil
+        C.controlRevision = C.controlRevision + 1
+        C.releaseActor()
+    end
+    local function check()
+        if C.controlUntil and now() < C.controlUntil
+            and tostring(Ext.Utils.GetGameState()) == "Running" then
+            if C.protagonist and not same(C.protagonist, C.hostAvatar()) then revoke() end
+            return
+        end
+        C.controlReset()
+    end
+    function C.controlTicket()
+        return C.protagonist and (C.epoch .. ":" .. tostring(C.controlRevision)) or nil
+    end
+    function C.controlHeartbeat(session, lease, request)
+        check()
+        local existing = session == C.controlSession
+        if not existing then
+            C.controlReset()
+            C.controlSession = session
+        end
+        C.controlUntil = now() + lease
+        local consent
+        if request then
+            consent = { id = request.id }
+            if not existing or request.session ~= session or request.epoch ~= C.epoch then
+                consent.error = "存档或控制器连接已变更，请重新启用接管"
+            elseif not C.controlSubscribed then
+                consent.error = "游戏缺少接管所需的会话与心跳监控"
+            elseif not C.protagonist then
+                local avatar, reason = C.hostAvatar()
+                if not avatar then
+                    consent.error = reason
+                else
+                    C.releaseActor()
+                    C.controlRevision = (C.controlRevision or 0) + 1
+                    C.protagonistGrant = C.epoch .. ":" .. C.controlRevision
+                    C.protagonist, C.agent, C.human = avatar, avatar, avatar
+                end
+            end
+        end
+        return Ext.Json.Stringify({ ticket = C.controlTicket(), grant = C.protagonistGrant, consent = consent,
+            id = C.agent, human = human(),
+            name = C.agent and C.name(C.agent) or nil, epoch = C.epoch, revision = C.controlRevision or 0 })
+    end
+    function C.controlReset()
+        if C.protagonist then
+            revoke()
+        elseif C.controlSession then
+            C.controlStop()
+        end
+        C.controlSession, C.controlUntil = nil, nil
+    end
+    function C.controlStop()
+        C.controlRevision = (C.controlRevision or 0) + 1
+        C.stopActions()
+        return Ext.Json.Stringify({ ticket = C.controlTicket(), epoch = C.epoch, revision = C.controlRevision })
+    end
+    function C.checkControl(op, ticket)
+        local current = C.controlTicket()
+        if ticket and ticket ~= current then error("protagonist permission changed") end
+        if current and not read[op] and ticket ~= current then
+            error("protagonist actions require an active local Free Explore task")
+        end
+        if current and (op == "trade_open" or op == "trade_check" or op == "travel" or op == "reactions") then
+            error("this action is unavailable during protagonist takeover")
+        end
+        if C.agent and not current and not C.companionAllowed(C.agent) then
+            C.releaseActor()
+            error("this companion is now reserved for another player")
+        end
+    end
+    -- The network shortcut can only stop or revoke. The random session is
+    -- installed only in the owning debugger's local client, never broadcast.
+    function C.onLocalControl(_, payload)
+        check()
+        if not C.controlSession or type(payload) ~= "string" then return end
+        local session, cmd = payload:match("^([0-9a-f]+):(%a+)$")
+        if session ~= C.controlSession then return end
+        if cmd == "off" then
+            revoke()
+        elseif cmd == "stop" then
+            C.controlStop()
+        end
+    end
+    if not C.controlSubscribed and Ext.Events.Tick then
+        if Ext.RegisterNetListener then
+            pcall(Ext.RegisterNetListener, channel, function(...) C.onLocalControl(...) end)
+        end
+        Ext.Events.Tick:Subscribe(function() C.checkControlLease() end)
+        if Ext.Events.SessionLoading then
+            Ext.Events.SessionLoading:Subscribe(function() C.controlReset() end)
+        end
+        C.controlSubscribed = true
+    end
+    C.checkControlLease = check
+end
+
+-- Match the actual requested roll to the dialogue and its actor. No outcome is written here.
+function C.dialogueRoll(id, instance)
+    local ok, result = pcall(function()
+        local me = entity(id)
+        local roll = Ext.System.ServerRoll.EntityToRollEntity[me]
+        local r = roll and roll.RequestedRoll
+        if not r or r.Canceled or not r.RollUuid or r.DialogId ~= tonumber(instance)
+            or r.Roller ~= me then return nil end
+        return tostring(r.RollUuid)
+    end)
+    return ok and result or nil
+end
+
+function C.ops.dialogue_roll(args)
+    if not C.protagonist or dialogOf(C.protagonist) ~= tonumber(args.instance) then
+        return { verified = false }
+    end
+    local id = C.dialogueRoll(C.protagonist, args.instance)
+    return { verified = id ~= nil, roll_id = id and id:lower() or nil }
+end
+
+function C.checkTask(authority)
+    C.checkControlLease()
+    if authority.epoch and authority.epoch ~= C.epoch then error("save changed during the task") end
+    if authority.revision and authority.revision ~= (C.controlRevision or 0) then
+        error("control changed during the task")
+    end
+end
+
+function C.authorizeUI(json)
+    local request = Ext.Json.Parse(json)
+    local a = request.authority
+    local ok, result = pcall(function()
+        C.checkTask(a)
+        C.checkControl(request.op, a.ticket)
+        local args = request.args
+        if not args then
+            if C.protagonist then error("use the guarded local protagonist UI") end
+            return true
+        end
+        if not C.protagonist or not same(args.owner, C.protagonist) then
+            error("protagonist permission changed")
+        end
+        if dialogOf(C.protagonist) ~= tonumber(args.instance) then
+            error("the protagonist's dialogue changed")
+        end
+        if request.op == "roll" or request.op == "roll_boost" or request.op == "roll_state" then
+            local id = C.dialogueRoll(C.protagonist, args.instance)
+            if not id or id:lower() ~= args.roll_id then error("the requested dialogue roll changed") end
+        end
+        return true
+    end)
+    return Ext.Json.Stringify(ok and { ok = true, result = result } or { ok = false, error = tostring(result) })
+end
+
 function C.rpc(json)
     local ok, req = pcall(Ext.Json.Parse, json)
     if not ok or type(req) ~= "table" then
@@ -4503,9 +4761,11 @@ function C.rpc(json)
     if not fn then return Ext.Json.Stringify({ ok = false, error = "unknown op " .. tostring(req.op) }) end
     local args = req.args or {}
     C.actor = nil
-    pcall(C.watchFight)  -- every call sees the fight as it is now, not as at the last events poll
-    pcall(C.watchTurn)
     local ok2, res = pcall(function()
+        C.checkTask(req)
+        C.checkControl(req.op, req.ticket)
+        pcall(C.watchFight)
+        pcall(C.watchTurn)
         if args.as then
             if not C.ACTS_FOR_SUMMON[req.op] then error(req.op .. " cannot be done by a summon") end
             C.actor = C.summonOf(args.as)

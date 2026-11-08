@@ -266,6 +266,10 @@ Ext = {
         rawset(t, name, ev)
         return ev
     end }),
+    RegisterNetListener = function(channel, fn)
+        W.net = W.net or {}
+        W.net[channel] = fn
+    end,
     Json = { Parse = function(s) return PY_parse(s) end, Stringify = function(v) return PY_stringify(v) end },
     Loca = { GetTranslatedString = function(h) return h end },
     IO = { LoadFile = function(path, ctx)
@@ -489,7 +493,7 @@ end
 
 Osi = {
     DB_PartyMembers = { Get = function() return { { W.host }, { W.sh } } end },
-    DB_Avatars = { Get = function() return { { W.host } } end },
+    DB_Avatars = { Get = function() return W.avatars or { { W.host } } end },
     DB_Dialogs = { Get = function(_, npc)
         if g(npc) == g(W.npc) then return { { W.npc, "Arron_Dialog" } } end
         return {}
@@ -543,6 +547,7 @@ Osi = {
     end,
     PROC_Camp_Leave = function(u) local k = g(u); moveTo(k, W.camp[k]); W.camp[k] = nil end,
     GetHostCharacter = function() return W.selected or W.host end,
+    GetReservedUserID = function(id) return (W.reserved or {})[g(id)] or 1 end,
     GetDisplayName = function(u) return W.names[g(u)] end,
     GetPosition = function(u) local p = W.pos[g(u)]; if p then return p[1], p[2], p[3] end end,
     IsOnStage = function(u) return b(not (W.offstage and W.offstage[g(u)])) end,
@@ -627,7 +632,7 @@ Osi = {
         W.walked_how = how
         if not W.slow then moveTo(ch, { x, y, z }) end -- MOCK.slow: still on the way
     end,
-    PurgeOsirisQueue = function() end,
+    PurgeOsirisQueue = function(u) W.purged = g(u) end,
     Use = function(ch, it)
         local x = W.item[g(it)]
         if not x then -- using a world object: MOCK.onUse[uuid](who) does what it does
