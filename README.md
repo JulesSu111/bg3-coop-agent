@@ -1,3 +1,15 @@
+这是个人用的一个适配codex的版本，使用一个笨办法修正了游戏内agent框不会主动响应的问题，并加入了控制token用量的回合限制机制，可通过config文件夹内的json修改。
+不保证兼容性，不建议使用，我确实没想到更好的方法。
+## Windows 本地无人值守模式
+新增登录后台启动、游戏内交互和事件驱动 Codex 控制器。安装、配置、架构及实机验收清单见 [Windows 使用说明](docs/windows-local.md)。
+
+## 主角控制模式
+目前新增一个实验性的主角控制模式，移除了原项目对操纵主角的限制并新增部分相应适配。
+
+以下是原readme：
+
+
+
 # bg3-coop-agent
 
 中文 | [English](README.en.md)
@@ -164,6 +176,3 @@ claude
 
 MIT，见 [LICENSE](LICENSE)。
 
-## Windows 本地无人值守模式
-
-新增登录后台启动、游戏内交互和事件驱动 Codex 控制器。安装、配置、架构及实机验收清单见 [Windows 使用说明](docs/windows-local.md)。真实 BG3/OAuth 端到端尚未实测。
